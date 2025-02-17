@@ -20,7 +20,6 @@ library("gridExtra")
 
 ```{r}
 my_colors <- c( "#ffc425", "darkorange","darkgreen","skyblue","darkblue")
-
 ```
 
 
@@ -654,7 +653,8 @@ enr<-clusterProfiler::enricher(
   TERM2NAME = TERM2NAME_ASIL
 )
 
-tibble(as_tibble(enr@result)) %>% filter(Count>1 & p.adjust<0.05) %>% arrange(p.adjust) %>% dplyr::select(Description, GeneRatio, BgRatio, pvalue, p.adjust, geneID)
+GO_dmrs_groups<-tibble(as_tibble(enr@result)) %>% filter(Count>1 & p.adjust<0.05) %>% arrange(p.adjust) %>% dplyr::select(Description, GeneRatio, BgRatio, pvalue, p.adjust, geneID)%>% separate(Description, c("Cat","Description"), sep=":") %>% arrange(desc(as.character(Cat)), p.adjust)
+knitr::kable(GO_dmrs_groups, caption = "Number of polymorphic SNPs in the different selection groups") 
 ```
 
 
@@ -668,7 +668,7 @@ meth <- getMeth(bs.filtered, group_dmrs_merged, what = "perRegion", confint = FA
 
 #meth <- t(apply(meth, 1, function(xx) tapply(xx, pData(bs.filtered)$group, mean))) %>% as_tibble(meth)
 meth_cen<-meth # - rowMeans(meth)
-rownames(meth)<-c(1:88)
+rownames(meth)<-c(1:86)
 sample_col<-data.frame(size=pData(bs.filtered)$size,group=pData(bs.filtered)$group)
 rownames(sample_col)<-rownames(pData(bs.filtered))
 my_colour = list(group = c(D1Gen5= "#ffc425", D2Gen5="darkorange", U1Gen5="skyblue", U2Gen5= "darkblue"),size = c(S = "#ddfff7", M = "#83c5be", L = "#006d77"))

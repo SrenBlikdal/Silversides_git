@@ -1,0 +1,407 @@
+---
+title: "Silversides_sup_analysis"
+author: "SrenBlikdal"
+date: "2025-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###Chapter 2
+DNA methylation data 
+
+```{r}
+library("bsseq")
+library("tidyverse")
+library("limma")
+library("GenomicFeatures")
+library("vegan")
+library("annotatr")
+library("rtracklayer")
+library("pheatmap")
+library("methylSig")
+library("gridExtra")
+library("bsseq")
+library("tidyverse")
+library("ggrepel")
+library("readr")
+library("BiocParallel")
+library("GenomicFeatures")
+library("sva")
+library("gridExtra")
+library("annotatr")
+library("rtracklayer")
+library("topGO")
+library("pheatmap")
+```
+
+### Methylation data
+WGBS corresponds to sampling from a binomial distribution with the probability of success corresponding to the true methylation level. The variance of the methylation level can be predicted by the formula p(1-p)/n, where p is the methylation level and n is the number of reads. The variance of the methylation level is therefore inversely proportional to the number of reads covering the site and more reliable when the coverage is high.
+
+### Read the data
+The CpG reports are imported and combined into a BS object (n (number of samples) x m (number of sites) matrix with metadata). 
+```{r, message=FALSE, warning=FALSE}
+D1_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/D1", full.names = T)
+D1<-read.bismark(D1_files)
+D2_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/D2", full.names = T)
+D2<-read.bismark(D2_files)
+R1_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/R1", full.names = T)
+R1<-read.bismark(R1_files)
+U1_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/U1", full.names = T)
+U1<-read.bismark(U1_files)
+U2_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/U2", full.names = T)
+U2<-read.bismark(U2_files)
+bs <-bsseq::combine(D1, D2, R1, U1, U2)
+dim(bs)
+```
+
+### Remove all sites not on the main chromosomes
+We restrict the analysis to the main chromosomes (Mme_chr01-Mme_chr24) and ignore reads mapping to the many small unanchored contigs.
+
+```{r}
+bs<-chrSelectBSseq(bs, seqnames = c("Mme_chr01","Mme_chr02","Mme_chr03","Mme_chr04","Mme_chr05","Mme_chr06","Mme_chr07","Mme_chr08","Mme_chr09","Mme_chr10","Mme_chr11","Mme_chr12","Mme_chr13","Mme_chr14","Mme_chr15","Mme_chr16","Mme_chr17","Mme_chr18","Mme_chr19","Mme_chr20","Mme_chr21","Mme_chr22","Mme_chr23","Mme_chr24"))
+dim(bs)
+getCoverage(bs, type="Cov") %>% mean(.) 
+getCoverage(bs, type="Cov") %>% sd(.) 
+```
+
+### Add metadata
+We add the metadata to the BS object.
+
+```{r}
+metadat<-read_tsv("~/Downloads/Metadata - Metadata.tsv") 
+#check the SampleID from the metadata is the same as the sampleNames in the bs object
+filenames<-sampleNames(bs)
+#get the SampleID from the filenames by removing the path and the file extension
+sampleID<-gsub(".*/", "", filenames) %>% gsub("_1_val_1_bismark_bt2_pe.deduplicated.CpG_report.txt.gz", "",.)
+#check that the sampleID from the filenames is the same as the SampleID in the metadata
+all(sampleID==metadat$SampleID)
+sampleNames(bs)<-metadat$SampleID
+pData(bs)$group<-metadat$Population
+pData(bs)$batch<-factor(metadat$Batch)
+pData(bs)$ID<-metadat$SampleID
+pData(bs)$length<-metadat$STD_Length
+pData(bs)$inversion<-metadat$Inversion
+pData(bs)$size<-metadat$Size
+```
+
+### Coverage filtering
+The higher the coverage the more reliable the methylation level, but on the same time, more sites gives better resolution for the analysis. When we plot how many sites are covered at a certain threshold in all samples the trade-off between coverage threshold and number of sites is clear.
+
+```{r}
+results <- tibble()
+for (i in 0:10) {
+  sites_count <- length(which(DelayedMatrixStats::rowSums2(getCoverage(bs, type = "Cov") >= i) == 68))
+  results <- bind_rows(results, tibble(threshold = i, sites = sites_count))
+}
+
+#plot the results with
+plot_cov<-ggplot(results, aes(x = as.factor(threshold), y= sites)) +
+  geom_point() +
+  ylim(0,10000000)+
+  geom_line() +
+  xlab("Coverage threshold") +
+  ylab("Number of sites") +
+  ggtitle("Number of sites with coverage above coverage threshold in all 68 samples") +
+  theme_bw()
+```
+
+This indicates that a coverage threshold of eg. 2X in all samples would remove a large fraction of the sites. However if we look at how many sites are actually covered above 2X in x number of samples the pattern is very different.     
+
+```{r}
+results <- tibble()
+for (i in 0:68) {
+  sites_count <- length(which(DelayedMatrixStats::rowSums2(getCoverage(bs, type = "Cov") >= 2) >= i))
+  results <- bind_rows(results, tibble(threshold = i, sites = sites_count))
+}
+#plot the results with
+plot_samples<-ggplot(results, aes(x = threshold, y= sites)) +
+  geom_point() +
+  ylim(0,10000000)+
+  geom_line() +
+  xlab("Samples threshold") +
+  ylab("Number of sites") +
+  ggtitle("Number of sites with coverage above 2X in x samples")+
+  theme_bw()
+```
+
+Point here is that even at very liberal coverage thresholds there's a lot of sites with higher coverage that we want to keep in the analysis. We can check the mean coverage across all 68 samples of the sites before and after filtering with the threshold of at least 2X in at least 49 samples used for the downstream analysis.
+
+### Filtering 
+We filter for low coverage sites by only keeping sites with a coverage of at least 2X in at least 49 samples.
+
+```{r, message=FALSE, warning=FALSE}
+raw<-getCoverage(bs, type="Cov") %>% rowMeans2(.) %>% as_tibble(.) %>% ggplot(.,aes(x=value)) + geom_histogram(binwidth = 1, center=T) + xlim(0,30) + ggtitle("Mean coverage before filtering") + xlab("Mean coverage") + ylab("Number of sites")+
+  theme_bw()
+
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs, type="Cov")>=2) >= 49)
+bs.filtered <- bs[loci.idx,]
+
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs.filtered, type="Cov")<=19) >= 49)
+bs.filtered <- bs.filtered[loci.idx,]
+
+filtered<-getCoverage(bs.filtered, type="Cov") %>% rowMeans2(.) %>% as_tibble(.) %>% ggplot(.,aes(x=value)) + geom_histogram(binwidth = 1, center=T) + xlim(0,30) + ggtitle("Mean coverage after filtering") + xlab("mean coverage") + ylab("Number of sites")+
+  theme_bw()
+
+grid.arrange(raw, filtered, ncol = 1)
+```
+
+```{r}
+grid.arrange(plot_cov,plot_samples,raw, filtered, ncol = 2)
+```
+
+### Chapter 3
+Filtering of potential SNPs from methylation data 
+
+### SNPs in WGBS data
+The issue with SNPs in methylation data is that the methods for the analyses of bisulfite sequencing assumes unmethylated cytosines are converted to uracil and thymine after PCR and read as thymine in the sequencing data. However in a C > T mutation the "CpG" will appear as a TG in the data i.e. a unmethylated CpG site. WGBS data mapped to a reference genome with with many GC -> TC SNPs will therefore show lower methylation levels than if they are mapped to a perfect reference genome without any SNPs. 
+https://academic.oup.com/nar/article/47/19/e117/5545001. 
+
+
+## Data available
+For addressing this issue we use the data from the filtered data from last part. The main problems we try to solve is 1) add the fixed SNPs from in the group to the group specific reference genome and 2) remove the heterozygous SNPs from the methylation data.
+
+```{r}
+knitr::include_graphics("~/Downloads/Silversides_snps.png") 
+```
+
+### SNPs in the selection groups
+From the lcWGS we have the position and allele frequency (KnownEM) from ANGSD for each group which we import as a GRanges objects
+
+```{r message=FALSE, warning=FALSE}
+import_snps <- function(file){
+  read_tsv(file) %>%  
+            mutate(.,start=position-1, end=position, seqnames=chromo) %>%
+            as(., "GRanges")
+}
+
+snps_D1<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_D1Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+snps_D2<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_D2Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+snps_R1<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_R1Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+snps_U1<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_U1Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+snps_U2<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_U2Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+head(snps_D1)
+```
+
+The snps can be divided into homozygous and heterozygous SNPs. The homozygous SNPs are SNPs where the allele frequency (KnownEM) relative to the reference genome of the sampled group (n= 48-50) is > 0.99 and the heterozygous SNPs are SNPs where the allele frequency is =< 0.99.
+
+```{r}
+#add a collumn called type where knownEM >0.99 is "fixed" and knownEM <= 0.99 is "heterozygous"
+snps_D1_p<-as_tibble(snps_D1) %>% mutate(., type=ifelse(knownEM > 0.99, "fixed", "heterozygous")) 
+#make a histogram of knownEM collored by type
+ggplot(snps_D1_p, aes(x=knownEM, fill=type))+
+  geom_histogram(bins=100)+
+  scale_fill_manual(values = c("black","grey"), guide = guide_legend("SNP type"))+
+  theme_bw()
+```
+
+The fixed SNPs for each group has been added to their reference genome and we can count them by the substitution type and plot them in a table. 
+
+```{r}
+D1<-as_tibble(snps_D1) %>% 
+  filter(knownEM > 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="D1")
+D2<-as_tibble(snps_D2) %>% 
+  filter(knownEM > 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="D2")
+R1<-as_tibble(snps_R1) %>%
+  filter(knownEM > 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="R1")
+U1<-as_tibble(snps_U1) %>% 
+  filter(knownEM > 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="U1")
+U2<-as_tibble(snps_U2) %>%
+  filter(knownEM > 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="U2")
+
+#make a table of sub vs group where each entry is the number of SNPs (n)
+bind_rows(D1,D2,R1,U1,U2) %>% 
+  spread(key=group, value=n) %>% 
+  arrange(desc(D1)) %>% 
+  as_tibble(.) %>% 
+  knitr::kable(., caption = "Number of fixed SNPs in the different selection groups")
+
+hom<-bind_rows(D1,D2,R1,U1,U2)
+sum(hom$n)/5
+hom_CG<-bind_rows(D1,D2,R1,U1,U2) %>% filter(sub %in%  c("C <-> T","A <-> G"))
+sum(hom_CG$n)/5
+
+```
+
+We do the same for the heterozygous SNPs
+
+```{r}
+D1<-as_tibble(snps_D1) %>% 
+  filter(knownEM <= 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="D1")
+D2<-as_tibble(snps_D2) %>% 
+  filter(knownEM <= 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="D2")
+R1<-as_tibble(snps_R1) %>%
+  filter(knownEM <= 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="R1")
+U1<-as_tibble(snps_U1) %>% 
+  filter(knownEM <= 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="U1")
+U2<-as_tibble(snps_U2) %>%
+  filter(knownEM <= 0.99) %>%
+  #group_by(major,minor) %>% 
+  #summarise(n=n()) %>%
+  mutate(., sub=ifelse(major < minor, paste(major,minor, sep=" <-> "), paste(minor,major, sep=" <-> "))) %>%
+  group_by(sub) %>%
+  summarise(n=n()) %>%
+  arrange(desc(n)) %>% 
+  mutate(group="U2")
+
+#make a table of sub vs group where each entry is the number of SNPs (n)
+bind_rows(D1,D2,R1,U1,U2) %>% 
+  spread(key=group, value=n) %>% 
+  arrange(desc(D1)) %>% 
+  as_tibble(.) %>% 
+  knitr::kable(., caption = "Number of polymorphic SNPs in the different selection groups") 
+
+het<-bind_rows(D1,D2,R1,U1,U2)
+sum(het$n)/5
+het_CG<-bind_rows(D1,D2,R1,U1,U2) %>% filter(sub %in%  c("C <-> T","A <-> G"))
+sum(het_CG$n)/5
+```
+
+### Chapter 4
+-Centralt spørgsmål:
+Hvad bliver der selected for? Følger sekventering af DNA methylation dette? 
+
+-Large effect vs small effect? 
+Følger
+
+Artificial selection can rapidly induce phenotypic differences and change allele frequencies across thousands of sites. In an iconic experiment, four generations of artificial size selection in Atlantic silversides (Menidia menidia) resulted in 25% longer and twofold heavier fish in up-selected lines relative to down-selected lines (Conover and Munch 2002). Therkildsen et al. (2019) later showed the rapid phenotypic change to be associated with significant allele frequency shifts across 1000s of sites that showed consistent divergence between replicate lines subjected to opposite selection pressures.                      
+
+These results are based on single nucleotide polymorphisms, however, genomic diversity may not be restricted to differences in the primary sequence of the DNA. To investigate if there were any signatures of artificial selection on the epigenome - we revisited a subset of samples from the iconic experiment to investigate the DNA methylation patterns.
+
+### Samples 
+
+DNA was extracted from gill tissue of 26 samples from the selection experiment and for each sample, the genome was sequenced to a mean effective coverage of ~5X using whole genome bisulfite sequencing. After the preliminary results, additionally 42 samples from generation five were extracted and sequenced. 
+
+For further detail of the selected samples please see github/metadata.csv (to be uploaded) 
+
+### Mapping and QC 
+
+Extracted DNA was send to Novogene who prepared bisulfite converted libraries and sequenced using 150 PE sequencing. In short raw reads where examined using FastQC before and Adapter trimming using Trimgalora. Reads where mapped against the Atlantic silverside reference genome (Mmenidia_refgenome_anchored.all_renamed_v2.fasta) using Bismark keeping only uniquely aligned reads. After deduplication, the methylation level for each site where estimated by comparing the number og converted cytosines to unconverted cytosines using bismark_methyl_extractor. As end-repair interfere with methylation estimates, we used hard clipping of sites to remove the ends of each reads affected by this.     
+
+The bash script used for this can be found here github/mapping.sh (to be uploaded)
+The reports gathered using MultiQC can be found here. (to be uploaded)
+
+### Read the data in R 
+
+```{r, include=TRUE, message=FALSE, warning=FALSE}
+
+```
+
+The resulting 'bismark coverage files' displaying the methylation estimate and coverage of each site are loaded into R and analysed using BSseq.
+
+## Load the data
+
+```{r message=FALSE, warning=FALSE}
+GO<-read_tsv("~/Documents/Silversides/Mmenidia_annotation_files/omicsbox_blast2go_annotation_table.txt")
+GeneID<- substr(GO$SeqName,1, 8)
+GO$GeneID<-GeneID
+bs.filtered <- HDF5Array::loadHDF5SummarizedExperiment("~/Documents/Silversides/final.bs.filtered.smooth.hdf5")
+my_colors <- c( "#ffc425", "darkorange","darkgreen","skyblue","darkblue")
+txdb <- makeTxDbFromGFF("~/Documents/Silversides/Mmenidia_annotation_files/mme_annotation_anchored_genome_final_clean.noseq.gff", format="gff3")
+broads <- GenomicFeatures::genes(txdb)
+anno<-rtracklayer::readGFF("~/Documents/Silversides/Mmenidia_annotation_files/mme_annotation_anchored_genome_final_clean.noseq.gff", version=0,columns=NULL, tags=NULL, filter=NULL, nrows=-1,raw_data=FALSE)
+myGranges<-as(anno, "GRanges")
+```
+
+### CpG and methylation patterns around TSS
+```{r}
+prom_u<-promoters(GenomicFeatures::genes(txdb), upstream = 4000, downstream = 1) %>%
+  subsetByOverlaps(bs.filtered,.)
+prom_1<-promoters(GenomicFeatures::genes(txdb), upstream = 1, downstream = 1)
+d_u<-distanceToNearest(prom_u, prom_1, ignore.strand=F, )
+mean.meth_u<-getMeth(prom_u, type="raw") %>% rowMeans(.)
+
+dat_u<-data.frame(mean.meth=mean.meth_u,dist=d_u) %>% mutate(dist=-dist.distance)
+
+prom_d<-promoters(GenomicFeatures::genes(txdb), upstream = 1, downstream = 4000)%>%
+  subsetByOverlaps(bs.filtered,.)
+d_d<-distanceToNearest(prom_d, prom_1, ignore.strand=F, )
+mean.meth_d<-getMeth(prom_d, type="raw") %>% rowMeans(.)
+
+dat_d<-data.frame(mean.meth=mean.meth_d,dist=d_d) %>% mutate(dist=dist.distance)
+
+dat<-bind_rows(dat_u,dat_d)
+
+p1<-ggplot(dat, aes(x=dist,y=mean.meth))+
+  geom_point(alpha=0.005)+
+  geom_smooth()+
+  ylim(c(0,1))+
+  ylab("Mean methylation")+
+  xlab("Distance to TSS")+ 
+  theme_bw(base_size=16)
+
+p2<-ggplot(dat, aes(x=dist))+
+  geom_histogram(binwidth = 100)+
+  ylab("CpG density")+
+  xlab("Distance to TSS")+ 
+  theme_bw(base_size=16)
+
+grid.arrange(p2,p1, ncol=1)
+```
+
+
