@@ -1,0 +1,1126 @@
+---
+title: "Silversides_main_analysis"
+author: "SrenBlikdal"
+date: "2025-01-29"
+output: html_document
+---
+
+```{r}
+library("bsseq")
+library("tidyverse")
+library("limma")
+library("GenomicFeatures")
+library("vegan")
+library("annotatr")
+library("rtracklayer")
+library("pheatmap")
+library("methylSig")
+library("gridExtra")
+```
+
+```{r}
+my_colors <- c( "#ffc425", "darkorange","darkgreen","skyblue","darkblue")
+
+```
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## WGBS analysis of the silversides
+
+### Read the data
+The CpG reports are imported and combined into a BS object (n (number of samples) x m (number of sites) matrix with metadata). 
+```{r, message=FALSE, warning=FALSE}
+D1_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/D1", full.names = T)
+D1<-read.bismark(D1_files)
+D2_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/D2", full.names = T)
+D2<-read.bismark(D2_files)
+R1_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/R1", full.names = T)
+R1<-read.bismark(R1_files)
+U1_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/U1", full.names = T)
+U1<-read.bismark(U1_files)
+U2_files<-base::list.files("~/Documents/Silversides/cyto_repports/6_CpG_reports/U2", full.names = T)
+U2<-read.bismark(U2_files)
+bs <-bsseq::combine(D1, D2, R1, U1, U2)
+dim(bs)
+```
+
+### Remove all sites not on the main chromosomes
+We restrict the analysis to the main chromosomes (Mme_chr01-Mme_chr24) and ignore reads mapping to the many small unanchored contigs.
+
+```{r}
+bs<-chrSelectBSseq(bs, seqnames = c("Mme_chr01","Mme_chr02","Mme_chr03","Mme_chr04","Mme_chr05","Mme_chr06","Mme_chr07","Mme_chr08","Mme_chr09","Mme_chr10","Mme_chr11","Mme_chr12","Mme_chr13","Mme_chr14","Mme_chr15","Mme_chr16","Mme_chr17","Mme_chr18","Mme_chr19","Mme_chr20","Mme_chr21","Mme_chr22","Mme_chr23","Mme_chr24"))
+dim(bs)
+```
+
+### Add metadata to the BS object
+
+```{r}
+metadat<-read_tsv("~/Downloads/Metadata - Metadata.tsv") 
+#check the SampleID from the metadata is the same as the sampleNames in the bs object
+filenames<-sampleNames(bs)
+#get the SampleID from the filenames by removing the path and the file extension
+sampleID<-gsub(".*/", "", filenames) %>% gsub("_1_val_1_bismark_bt2_pe.deduplicated.CpG_report.txt.gz", "",.)
+#check that the sampleID from the filenames is the same as the SampleID in the metadata
+all(sampleID==metadat$SampleID)
+sampleNames(bs)<-metadat$SampleID
+pData(bs)$group<-metadat$Population
+pData(bs)$batch<-factor(metadat$Batch)
+pData(bs)$ID<-metadat$SampleID
+pData(bs)$length<-metadat$STD_Length
+pData(bs)$inversion<-metadat$Inversion
+pData(bs)$size<-metadat$Size
+```
+
+```{r}
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs, type="Cov")>=2) >= 49)
+bs.filtered <- bs[loci.idx,]
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs.filtered, type="Cov")<=19) >= 49)
+bs.filtered <- bs.filtered[loci.idx,]
+```
+
+### SNPs in the selection groups
+From the lcWGS we have the position and allele frequency (KnownEM) from ANGSD for each group which we import as a GRanges objects
+
+```{r message=FALSE, warning=FALSE}
+import_snps <- function(file){
+  read_tsv(file) %>%  
+            mutate(.,start=position-1, end=position, seqnames=chromo) %>%
+            as(., "GRanges")
+}
+
+snps_D1<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_D1Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+snps_D2<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_D2Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+snps_R1<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_R1Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+snps_U1<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_U1Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+snps_U2<-import_snps("~/Documents/Silversides/silverside_data-selected/Mme_exp_Gen5_MixupsRemoved_U2Gen5_mindp10_maxdp500_minind8_minq20_minmaf0_filtered.mafs")
+head(snps_D1)
+```
+
+```{r}
+bs<-bs.filtered
+
+bs.D1 <- bs[,which(pData(bs)$group %in% "D1Gen5")]
+D1_nosnps<-subsetByOverlaps(bs.D1, snps_D1[snps_D1$knownEM <= 0.99], invert = T)
+
+bs.D2 <- bs[,which(pData(bs)$group %in% "D2Gen5")]
+D2_nosnps<-subsetByOverlaps(bs.D2, snps_D2[snps_D2$knownEM <= 0.99], invert = T)
+
+bs.R1 <- bs[,which(pData(bs)$group %in% "R1Gen5")]
+R1_nosnps<-subsetByOverlaps(bs.R1, snps_R1[snps_R1$knownEM <= 0.99], invert = T)
+
+bs.U1 <- bs[,which(pData(bs)$group %in% "U1Gen5")]
+U1_nosnps<-subsetByOverlaps(bs.U1, snps_U1[snps_U1$knownEM <= 0.99], invert = T)
+
+bs.U2 <- bs[,which(pData(bs)$group %in% "U2Gen5")]
+U2_nosnps<-subsetByOverlaps(bs.U2, snps_U2[snps_U2$knownEM <= 0.99], invert = T)
+
+bs<-bsseq::combine(D1_nosnps, D2_nosnps, R1_nosnps, U1_nosnps, U2_nosnps)
+dim(bs)
+```
+
+```{r}
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs, type="Cov")>=2) >= 49)
+bs.filtered <- bs[loci.idx,]
+
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs.filtered, type="Cov")<=19) >= 49)
+bs.filtered <- bs.filtered[loci.idx,]
+
+dim(bs.filtered)
+```
+
+
+##Figure 1 PCA plot
+
+PCA can not handle missing values, so we filter for sites with a coverage of at least 1 in all 68 samples. 
+
+```{r}
+bs.filtered <- HDF5Array::loadHDF5SummarizedExperiment("~/Documents/Silversides/final.bs.filtered.smooth.hdf5")
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs.filtered, type="Cov")>=1) >= 68)
+bs.filtered_pca<-bs.filtered[loci.idx,]
+```
+
+
+### Small fish 
+```{r}
+windowsize=1000
+mincpgs=10
+
+sample.idx<-which(bs.filtered_pca$size == "S")
+bs.filtered_s<-bs.filtered_pca[,sample.idx]
+
+# Tile the genome
+BSseq.obj.tiled <- tile_by_windows(bs = bs.filtered_s, win_size = windowsize)
+
+# Filter out CpG tiles based on cutoff of number of CpGs
+
+BSseq.obj.tiled.filtered <- BSseq.obj.tiled[rowSums(as.matrix(countOverlaps(BSseq.obj.tiled, bs.filtered_s))) >= mincpgs, ]
+
+m<-as.matrix(getMeth(BSseq.obj.tiled.filtered, type = "raw"))
+
+pca<- m %>% t(.) %>% prcomp(.,center=T, scale. = F)
+percent_variance_pca<-summary(pca)$importance["Proportion of Variance",] * 100
+pca_plot<-as_tibble(pca$x) %>% bind_cols(group=bs.filtered_s$group, batch=bs.filtered_s$batch, length=bs.filtered_s$length)
+
+p_s<-ggplot(pca_plot, aes(x=PC1, y=PC2, color=group)) +
+  geom_point()  +
+  #geom_text_repel(size=4) +
+  xlab(label = paste("PC1 (",round(percent_variance_pca[1],1),"%)")) +
+  ylab(label = paste("PC2 (",round(percent_variance_pca[2],1),"%)")) +
+  #ggtitle("Medium-sized fish") +
+  xlim(-40,40)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_color_manual(values = my_colors[-3], guide = guide_legend("Selection group"))
+
+p_s_l<-ggplot(pca_plot, aes(x=PC1, y=length, color=group)) +
+  geom_point()  +
+  #geom_text_repel(size=4) +
+  xlab(label = paste("PC1 (",round(percent_variance_pca[1],1),"%)")) +
+  ylab("Length in mm") +
+  #ggtitle("Medium-sized fish") +
+  xlim(-40,40)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_color_manual(values = my_colors[-3], guide = guide_legend("Selection group"))
+
+p_s_a<-ggplot(pca_plot, aes(x=PC1, y=PC2, color=group)) +
+  geom_point()  +
+  stat_ellipse(aes(x=PC1,y=PC2,fill=group),geom="polygon", level=0.95, alpha=0.2)+
+  #geom_text_repel(size=4) +
+  xlab(label = paste("PC1 (",round(percent_variance_pca[1],1),"%)")) +
+  ylab(label = paste("PC2 (",round(percent_variance_pca[2],1),"%)")) +
+  #ggtitle("Medium-sized fish") +
+  #xlim(-40,40)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_color_manual(values = my_colors[-3], guide = guide_legend("Selection group"))+
+  scale_fill_manual(values = my_colors[-3], guide = guide_legend("Selection group"))
+
+cor.test(pca_plot$PC1, pca_plot$length)
+
+pcs <- pca_plot[,1:2]
+a<-adonis2(pcs ~ group, data = pca_plot, method = "euclidean", permutations = 99999)
+a
+```
+
+### Medium fish 
+```{r}
+
+windowsize=1000
+mincpgs=10
+
+sample.idx<-which(bs.filtered_pca$size == "M")
+bs.filtered_m<-bs.filtered_pca[,sample.idx]
+
+# Tile the genome
+BSseq.obj.tiled <- tile_by_windows(bs = bs.filtered_m, win_size = windowsize)
+
+# Filter out CpG tiles based on cutoff of number of CpGs
+
+BSseq.obj.tiled.filtered <- BSseq.obj.tiled[rowSums(as.matrix(countOverlaps(BSseq.obj.tiled, bs.filtered_m))) >= mincpgs, ]
+
+m<-as.matrix(getMeth(BSseq.obj.tiled.filtered, type = "raw"))
+
+pca<- m %>% t(.) %>% prcomp(.,center=T, scale. = F)
+percent_variance_pca<-summary(pca)$importance["Proportion of Variance",] * 100
+pca_plot<-as_tibble(pca$x) %>% bind_cols(group=bs.filtered_m$group, batch=bs.filtered_m$batch, length=bs.filtered_m$length)
+
+p_m<-ggplot(pca_plot, aes(x=PC1, y=PC2, color=group)) +
+  geom_point()  +
+  #geom_text_repel(size=4) +
+  xlab(label = paste("PC1 (",round(percent_variance_pca[1],1),"%)")) +
+  ylab(label = paste("PC2 (",round(percent_variance_pca[2],1),"%)")) +
+  #ggtitle("Medium-sized fish") +
+  xlim(-40,40)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_color_manual(values = my_colors, guide = guide_legend("Selection group"))
+
+# the code above gives me NAs change 
+
+p_m_l<-ggplot(pca_plot, aes(x=PC1, y=length, color=group)) +
+  geom_point()  +
+  #geom_text_repel(size=4) +
+  xlab(label = paste("PC1 (",round(percent_variance_pca[1],1),"%)")) +
+  ylab("Length in mm") +
+  #ggtitle("Medium-sized fish") +
+  xlim(-40,40)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_color_manual(values = my_colors, guide = guide_legend("Selection group"))
+
+p_m_a<-ggplot(pca_plot, aes(x=PC1, y=PC2, color=group)) +
+  geom_point()  +
+  stat_ellipse(aes(x=PC1,y=PC2,fill=group),geom="polygon", level=0.95, alpha=0.2)+
+  #geom_text_repel(size=4) +
+  xlab(label = paste("PC1 (",round(percent_variance_pca[1],1),"%)")) +
+  ylab(label = paste("PC2 (",round(percent_variance_pca[2],1),"%)")) +
+  #ggtitle("Medium-sized fish") +
+  #xlim(-40,40)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_color_manual(values = my_colors, guide = guide_legend("Selection group"))+
+  scale_fill_manual(values = my_colors, guide = guide_legend("Selection group"))
+
+cor.test(pca_plot$PC1, pca_plot$length)
+#use vegans permanova to test for differences in the PCA plot
+pcs <- pca_plot[,1:2]
+a<-adonis2(pcs ~ group, data = pca_plot, method = "euclidean", permutations = 99999)
+a
+```
+
+### Large fish 
+```{r}
+windowsize=1000
+mincpgs=10
+
+sample.idx<-which(bs.filtered_pca$size == "L")
+bs.filtered_l<-bs.filtered_pca[,sample.idx]
+
+# Tile the genome
+BSseq.obj.tiled <- tile_by_windows(bs = bs.filtered_l, win_size = windowsize)
+
+# Filter out CpG tiles based on cutoff of number of CpGs
+
+BSseq.obj.tiled.filtered <- BSseq.obj.tiled[rowSums(as.matrix(countOverlaps(BSseq.obj.tiled, bs.filtered_l))) >= mincpgs, ]
+
+m<-as.matrix(getMeth(BSseq.obj.tiled.filtered, type = "raw"))
+
+pca<- m %>% t(.) %>% prcomp(.,center=T, scale. = F)
+percent_variance_pca<-summary(pca)$importance["Proportion of Variance",] * 100
+pca_plot<-as_tibble(pca$x) %>% bind_cols(group=bs.filtered_l$group, batch=bs.filtered_l$batch, length=bs.filtered_l$length)
+
+p_l<-ggplot(pca_plot, aes(x=PC1, y=PC2, color=group)) +
+  geom_point()  +
+  #geom_text_repel(size=4) +
+  xlab(label = paste("PC1 (",round(percent_variance_pca[1],1),"%)")) +
+  ylab(label = paste("PC2 (",round(percent_variance_pca[2],1),"%)")) +
+  #ggtitle("Medium-sized fish") +
+  xlim(-40,40)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_color_manual(values = my_colors[-3], guide = guide_legend("Selection group"))
+
+p_l_l<-ggplot(pca_plot, aes(x=PC1, y=length, color=group)) +
+  geom_point()  +
+  #geom_text_repel(size=4) +
+  xlab(label = paste("PC1 (",round(percent_variance_pca[1],1),"%)")) +
+  ylab("Length in mm") +
+  #ggtitle("Medium-sized fish") +
+  xlim(-40,40)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_color_manual(values = my_colors[-3], guide = guide_legend("Selection group"))
+
+p_l_a<-ggplot(pca_plot, aes(x=PC1, y=PC2, color=group)) +
+  geom_point()  +
+  stat_ellipse(aes(x=PC1,y=PC2,fill=group),geom="polygon", level=0.95, alpha=0.2)+
+  #geom_text_repel(size=4) +
+  xlab(label = paste("PC1 (",round(percent_variance_pca[1],1),"%)")) +
+  ylab(label = paste("PC2 (",round(percent_variance_pca[2],1),"%)")) +
+  #ggtitle("Medium-sized fish") +
+  #xlim(-40,40)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_color_manual(values = my_colors[-3], guide = guide_legend("Selection group"))+
+  scale_fill_manual(values = my_colors[-3], guide = guide_legend("Selection group"))
+
+cor.test(pca_plot$PC1, pca_plot$length)
+pcs <- pca_plot[,1:2]
+a<-adonis2(pcs ~ group, data = pca_plot, method = "euclidean", permutations = 99999)
+a
+```
+
+```{r}
+grid.arrange(p_s, p_s_a, p_s_l, p_m, p_m_a, p_m_l, p_l, p_l_a, p_l_l, ncol=3)
+```
+
+```{r}
+grid.arrange(p_s, p_m, p_l, ncol=1)
+```
+
+##DMRs among groups
+### Smoothing the data
+```{r}
+#bs.filtered<-HDF5Array::loadHDF5SummarizedExperiment("~/Documents/Silversides/final.bs.filtered.hdf5")
+#bs.filtered.smoothed <- BSmooth(
+#    BSseq = bs.filtered, 
+#    BPPARAM = BiocParallel::MulticoreParam(4),
+#    verbose = TRUE) #Only works for bs.filtered in memory.. 
+#pData(bs.filtered.smoothed) %>% as_tibble %>% group_by(size) %>% summarise(n=n())
+#HDF5Array::saveHDF5SummarizedExperiment(bs.filtered.smoothed, "~/Documents/Silversides/final.bs.filtered.smooth.hdf5", replace=TRUE)
+```
+
+###Small fish
+
+```{r}
+set.seed(123)
+
+sample.idx<-which(bs.filtered$size == "S")
+bs.filtered_s<-bs.filtered[,sample.idx]
+
+desig=model.matrix(~0+bs.filtered_s$group)
+colnames(desig) <- gsub("bs.filtered_s\\$group", "", colnames(desig))
+cont <- makeContrasts(D1Gen5-D2Gen5, D1Gen5-U1Gen5, D1Gen5-U2Gen5, D2Gen5-U1Gen5, D2Gen5-U2Gen5, U1Gen5-U2Gen5, levels = desig)
+
+bs.filtered.fit.fstat <- bsseq:::BSmooth.fstat(bs.filtered_s, design = desig, contrasts = cont)
+
+#bs.filtered.fit.fstat <- bsseq:::fstat.pipeline(bs.filtered, design = desig, contrasts = cont,cutoff = c(-4.6 ^ 2, 4.6 ^ 2), fac = colnames(design), nperm = 4, coef = NULL, maxGap.sd = 10 ^ 8,maxGap.dmr = 300, mc.cores = 4 )
+bstat <- bsseq:::smoothSds(bs.filtered.fit.fstat)
+bstat <- bsseq:::computeStat(bstat, coef = NULL)
+dmrs_groups_s <- bsseq::dmrFinder(bstat, cutoff = c(-4.6, 4.6), verbose = F) %>% filter(n>=5)
+nrow(dmrs_groups_s)
+#permutation testing 
+idxMatrix <- bsseq:::permuteAll(1000, desig)
+
+nullDist <- bsseq:::getNullDistribution_BSmooth.fstat(BSseq = bs.filtered_s,
+                                                  idxMatrix = idxMatrix,
+                                                  design = desig,
+                                                  contrasts = cont,
+                                                  coef = NULL,
+                                                  cutoff = c (-4.6, 4.6),
+                                                  maxGap.sd = 10 ^ 8,
+                                                  maxGap.dmr = 300,
+                                                  mc.cores = 1)
+
+fwer <- bsseq:::getFWER.fstat(null = c(list(dmrs_groups_s), nullDist), type = "dmrs")
+dmrs_groups_s$fwer <- fwer
+#saveRDS(dmrs_groups_s, file ="~/Documents/Silversides/dmrs_groups_s_1000perms.rds")
+all_regions_s<-readRDS("~/Documents/Silversides/dmrs_groups_s_1000perms.rds")
+#meth <- getMeth(bs.filtered, dmrs_groups, what = "perRegion")
+#meth <- t(apply(meth, 1, function(xx) tapply(xx, pData(bs.filtered)$group, mean)))
+#dmrs_groups <- cbind(dmrs_groups, meth)
+dmrs_groups_s_sig <- subset(all_regions_s, fwer < 50)
+saveRDS(dmrs_groups_s_sig, file = "~/Documents/Silversides/dmrs_groups_s_sig_1000perms.rds")
+dmrs_groups_s_sig<-readRDS("~/Documents/Silversides/dmrs_groups_s_sig_1000perms.rds")
+#plotManyRegions(bs.filtered_b2_s, dmrs_groups_batch2_s[1:20,],addPoints = T, extend=1000, col = bs.filtered_b2_s$cols, lty = bs.filtered_b2_s$linet)
+```
+
+### Medium fish
+```{r}
+set.seed(123)
+bs.filtered<-bs.filtered.smoothed
+#bs.filtered <- HDF5Array::loadHDF5SummarizedExperiment("~/Documents/Silversides/final.bs.filtered.smooth.hdf5")
+sample.idx <- which(pData(bs.filtered)$group %in% c("D1Gen5","D2Gen5","U1Gen5","U2Gen5"))
+bs.filtered <- bs.filtered[,sample.idx]
+sample.idx <- which(pData(bs.filtered)$size=="M") 
+bs.filtered_m <- bs.filtered[,sample.idx]
+
+desig=model.matrix(~0+bs.filtered_m$group)
+colnames(desig) <- gsub("bs.filtered_m\\$group", "", colnames(desig))
+cont <- makeContrasts(D1Gen5-D2Gen5, D1Gen5-U1Gen5, D1Gen5-U2Gen5, D2Gen5-U1Gen5, D2Gen5-U2Gen5, U1Gen5-U2Gen5, levels = desig)
+
+bs.filtered.fit.fstat <- bsseq:::BSmooth.fstat(bs.filtered_m, design = desig, contrasts = cont)
+#bs.filtered.fit.fstat <- bsseq:::fstat.pipeline(bs.filtered, design = desig, contrasts = cont,cutoff = c(-4.6 ^ 2, 4.6 ^ 2), fac = colnames(design), nperm = 4, coef = NULL, maxGap.sd = 10 ^ 8,maxGap.dmr = 300, mc.cores = 4 )
+bstat <- bsseq:::smoothSds(bs.filtered.fit.fstat)
+bstat <- bsseq:::computeStat(bstat, coef = NULL)
+dmrs_groups_m <- bsseq::dmrFinder(bstat, cutoff = c(-4.6, 4.6), verbose = F) %>% filter(n>=5)
+nrow(dmrs_groups_m)
+#permutation testing
+idxMatrix <- bsseq:::permuteAll(1000, desig)
+
+nullDist <- bsseq:::getNullDistribution_BSmooth.fstat(BSseq = bs.filtered_m,
+                                                  idxMatrix = idxMatrix,
+                                                  design = desig,
+                                                  contrasts = cont,
+                                                  coef = NULL,
+                                                  cutoff = c (-4.6, 4.6),
+                                                  maxGap.sd = 10 ^ 8,
+                                                  maxGap.dmr = 300,
+                                                  mc.cores = 1)
+
+fwer <- bsseq:::getFWER.fstat(null = c(list(dmrs_groups_m), nullDist), type = "dmrs")
+dmrs_groups_m$fwer <- fwer
+#saveRDS(dmrs_groups_m, file ="~/Documents/Silversides/dmrs_groups_m_1000perms.rds")
+all_regions_m<-readRDS("~/Documents/Silversides/dmrs_groups_m_1000perms.rds")
+#meth <- getMeth(bs.filtered, dmrs_groups, what = "perRegion")
+#meth <- t(apply(meth, 1, function(xx) tapply(xx, pData(bs.filtered)$group, mean)))
+#dmrs_groups <- cbind(dmrs_groups, meth)
+dmrs_groups_m_sig <- subset(all_regions_m, fwer < 50)
+saveRDS(dmrs_groups_m_sig, file = "~/Documents/Silversides/dmrs_groups_m_sig_1000perms.rds")
+dmrs_groups_m_sig<-readRDS("~/Documents/Silversides/dmrs_groups_m_sig_1000perms.rds")
+#dmrs_groups_m_sig<-readRDS("~/Documents/Silversides/dmrs_groups_m_sig_1000perms.rds)
+plotManyRegions(bs.filtered_m, dmrs_groups_m_sig,addPoints = T, extend=1000)
+```
+
+
+### Large fish
+```{r}
+set.seed(123)
+
+sample.idx<-which(bs.filtered$size == "L")
+bs.filtered_l<-bs.filtered[,sample.idx]
+
+desig=model.matrix(~0+bs.filtered_l$group)
+colnames(desig) <- gsub("bs.filtered_l\\$group", "", colnames(desig))
+cont <- makeContrasts(D1Gen5-D2Gen5, D1Gen5-U1Gen5, D1Gen5-U2Gen5, D2Gen5-U1Gen5, D2Gen5-U2Gen5, U1Gen5-U2Gen5, levels = desig)
+
+bs.filtered.fit.fstat <- bsseq:::BSmooth.fstat(bs.filtered_l, design = desig, contrasts = cont)
+
+#bs.filtered.fit.fstat <- bsseq:::fstat.pipeline(bs.filtered, design = desig, contrasts = cont,cutoff = c(-4.6 ^ 2, 4.6 ^ 2), fac = colnames(design), nperm = 4, coef = NULL, maxGap.sd = 10 ^ 8,maxGap.dmr = 300, mc.cores = 4 )
+bstat <- bsseq:::smoothSds(bs.filtered.fit.fstat)
+bstat <- bsseq:::computeStat(bstat, coef = NULL)
+dmrs_groups_l <- bsseq::dmrFinder(bstat, cutoff = c(-4.6, 4.6), verbose = F) %>% filter(n>=5)
+nrow(dmrs_groups_l)
+#permutation testing 
+idxMatrix <- bsseq:::permuteAll(1000, desig)
+
+nullDist <- bsseq:::getNullDistribution_BSmooth.fstat(BSseq = bs.filtered_l,
+                                                  idxMatrix = idxMatrix,
+                                                  design = desig,
+                                                  contrasts = cont,
+                                                  coef = NULL,
+                                                  cutoff = c (-4.6, 4.6),
+                                                  maxGap.sd = 10 ^ 8,
+                                                  maxGap.dmr = 300,
+                                                  mc.cores = 1)
+
+fwer <- bsseq:::getFWER.fstat(null = c(list(dmrs_groups_l), nullDist), type = "dmrs")
+dmrs_groups_l$fwer <- fwer
+#saveRDS(dmrs_groups_l, file ="~/Documents/Silversides/dmrs_groups_l_1000perms.rds")
+all_regions_l<-readRDS("~/Documents/Silversides/dmrs_groups_l_1000perms.rds")
+#meth <- getMeth(bs.filtered, dmrs_groups, what = "perRegion")
+#meth <- t(apply(meth, 1, function(xx) tapply(xx, pData(bs.filtered)$group, mean)))
+#dmrs_groups <- cbind(dmrs_groups, meth)
+dmrs_groups_l_sig <- subset(all_regions_l, fwer < 50)
+saveRDS(dmrs_groups_l_sig, file = "~/Documents/Silversides/dmrs_groups_l_sig_1000perms.rds")
+#dmrs_groups_l_sig<-readRDS("~/Documents/Silversides/dmrs_groups_l_sig_1000perms.rds")
+#plotManyRegions(bs.filtered_b2_s, dmrs_groups_batch2_s[1:20,],addPoints = T, extend=1000, col = bs.filtered_b2_s$cols, lty = bs.filtered_b2_s$linet)
+```
+
+### DMRs betweeen groups - all
+For plotting we also do one with all groups combined
+```{r}
+bs.filtered <- HDF5Array::loadHDF5SummarizedExperiment("~/Documents/Silversides/final.bs.filtered.smooth.hdf5")
+pData(bs.filtered) %>% as_tibble %>% group_by(size) %>% summarise(n=n())
+sample.idx <- which(pData(bs.filtered)$group %in% c("D1Gen5","D2Gen5","U1Gen5","U2Gen5"))
+bs.filtered_a <- bs.filtered[,sample.idx]
+
+desig=model.matrix(~0+bs.filtered_a$group)
+colnames(desig) <- gsub("bs.filtered_a\\$group", "", colnames(desig))
+cont <- makeContrasts(D1Gen5-D2Gen5, D1Gen5-U1Gen5, D1Gen5-U2Gen5, D2Gen5-U1Gen5, D2Gen5-U2Gen5, U1Gen5-U2Gen5, levels = desig)
+
+bs.filtered.fit.fstat <- bsseq:::BSmooth.fstat(bs.filtered_a, design = desig, contrasts = cont)
+
+bstat <- bsseq:::smoothSds(bs.filtered.fit.fstat)
+bstat <- bsseq:::computeStat(bstat, coef = NULL)
+dmrs_groups_a <- bsseq::dmrFinder(bstat, cutoff = c(-4.6, 4.6), verbose = F) %>% filter(n>=5)
+nrow(dmrs_groups_a)
+```
+
+### Visualisation of DMRs
+
+```{r}
+regions<-as(dmrs_groups_a, "GRanges")
+positions<-ranges(regions)
+pos<-data.frame(chr=seqnames(regions),positions, areaStat=regions$areaStat) %>% filter(str_starts(chr, "Mme"))
+
+chr_length<-pos %>% group_by(chr) %>% 
+  summarize(chr_l=max(start)) %>%
+  mutate(.,cumsum=lag(c(cumsum(chr_l)))) %>%
+  mutate(cumsum = replace_na(cumsum, 0))
+
+sig_s<-subsetByOverlaps(as(dmrs_groups_a, "GRanges"),as(dmrs_groups_s_sig,"GRanges"),type="any")
+regions_sig<-as(sig_s, "GRanges")
+positions_sig<-ranges(regions_sig)
+pos_sig_s<-data.frame(chr=seqnames(regions_sig),positions_sig, areaStat=regions_sig$areaStat)  %>% filter(str_starts(chr, "Mme"))
+
+sig_m<-subsetByOverlaps(as(dmrs_groups_a, "GRanges"),as(dmrs_groups_m_sig,"GRanges"),type="any")
+regions_sig<-as(sig_m, "GRanges")
+positions_sig<-ranges(regions_sig)
+pos_sig_m<-data.frame(chr=seqnames(regions_sig),positions_sig, areaStat=regions_sig$areaStat)  %>% filter(str_starts(chr, "Mme"))
+
+sig_l<-subsetByOverlaps(as(dmrs_groups_a, "GRanges"),as(dmrs_groups_l_sig,"GRanges"),type="any")
+regions_sig<-as(sig_l, "GRanges")
+positions_sig<-ranges(regions_sig)
+pos_sig_l<-data.frame(chr=seqnames(regions_sig),positions_sig, areaStat=regions_sig$areaStat)  %>% filter(str_starts(chr, "Mme"))
+
+SMP_sig_s <- pos_sig_s %>%
+  left_join(.,chr_length, by="chr") %>%
+  mutate(BPcum=start+cumsum) 
+
+SMP_sig_m<- pos_sig_m %>%
+  left_join(.,chr_length, by="chr") %>%
+  mutate(BPcum=start+cumsum) 
+
+SMP_sig_l <- pos_sig_l %>%
+  left_join(.,chr_length, by="chr") %>%
+  mutate(BPcum=start+cumsum) 
+
+SMP <- pos %>%
+  left_join(.,chr_length, by="chr") %>%
+  mutate(BPcum=start+cumsum)  
+
+axisdf = SMP %>% group_by(chr) %>% summarize(center=(max(BPcum) + min(BPcum) ) / 2 )
+
+p<-ggplot(SMP, aes(x=BPcum, y=areaStat)) +
+  
+  # Show all points
+  geom_point(aes(color=as.factor(chr)), alpha=0.6, size=2) +
+  geom_point(data=SMP_sig_s,aes(x=BPcum, y=areaStat),alpha=1, size=6, stroke=1.5, shape=1,color = "aquamarine3")  +
+  geom_point(data=SMP_sig_m, aes(x=BPcum, y=areaStat),alpha=1, size=8, stroke=1.5, shape=1,color = "#83c5be")  +
+  geom_point(data=SMP_sig_l,aes(x=BPcum, y=areaStat),alpha=1, size=10, stroke=1.5, shape=1,color = "#006d77")  +
+  
+  scale_color_manual(values = c(rep(c("black", "lightgray"),15))) +
+  annotate(geom = "text",label=substr(axisdf$chr,5,10), x=axisdf$center, y=rep(c(-100),24), angle=0, size=5)+
+  xlab("") +
+  ylab("fstat across size classes") +
+
+  # Custom the theme:
+  theme_bw(base_size=16) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x  = element_blank(),
+    legend.position="none",
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    plot.title = element_text(hjust = 0.5))  
+p
+```
+
+```{r}
+s_dmrs<-dmrs_groups_s_sig %>% mutate(size="S")
+m_dmrs<-dmrs_groups_m_sig %>% mutate(size="M")
+l_dmrs<-dmrs_groups_l_sig %>% mutate(size="L")
+group_dmrs<-bind_rows(s_dmrs, m_dmrs, l_dmrs) %>% arrange(as.character(chr), as.numeric(start))
+#ad dmr number based on cluster if cluster is the same, give the same number
+group_dmrs$DMR<-as.numeric(factor(group_dmrs$cluster))
+```
+
+##Annotation
+
+```{r message=FALSE, warning=FALSE}
+GO<-read_tsv("~/Documents/Silversides/Mmenidia_annotation_files/omicsbox_blast2go_annotation_table.txt") %>% mutate(GeneID=substr(SeqName,1, 8))
+#bs.filtered <- HDF5Array::loadHDF5SummarizedExperiment("~/Documents/Silversides/final.bs.filtered.smooth.hdf5")
+#my_colors <- c( "#ffc425", "darkorange","darkgreen","skyblue","darkblue")
+txdb <- makeTxDbFromGFF("~/Documents/Silversides/Mmenidia_annotation_files/mme_annotation_anchored_genome_final_clean.noseq.gff", format="gff3")
+broads <- GenomicFeatures::genes(txdb)
+anno<-rtracklayer::readGFF("~/Documents/Silversides/Mmenidia_annotation_files/mme_annotation_anchored_genome_final_clean.noseq.gff", version=0,columns=NULL, tags=NULL, filter=NULL, nrows=-1,raw_data=FALSE)
+#myGranges<-as(anno, "GRanges")
+```
+
+```{r}
+group_dmrs_gr<-group_dmrs %>% as(.,"GRanges")
+proms<-promoters(GenomicFeatures::genes(txdb), upstream = 1500, downstream = 1500)
+ol<-findOverlaps(group_dmrs_gr,proms, type="any")
+GO[subjectHits(ol),]
+p <- proms[subjectHits(ol),] %>% as_tibble()
+pp <- group_dmrs_gr[queryHits(ol),]  %>% as_tibble()
+P_DMRs<-bind_cols(pp,p) %>% dplyr::select(.,DMR=DMR,seqnames=seqnames...1, start=start...2, end=end...3, width=width...4, strand=strand...5,GeneID=gene_id) 
+P_DMRgenes<-left_join(P_DMRs,GO,by =join_by("GeneID"=="GeneID")) 
+P_DMRgenes_sig<-P_DMRgenes
+```
+
+```{r}
+dmrs_groups<-P_DMRgenes_sig %>% filter(`e-Value`<1e-7) %>% dplyr::select(DMR, GeneID,Description) %>% unique(.) %>% left_join(group_dmrs,.,by="DMR") %>% dplyr::select(DMR	,chromosome=chr, start, end, n, width, invdensity, areaStat, maxStat, fwer, size, GeneID, Description)
+clipr::write_clip(dmrs_groups)
+#copy to sheets "dmrs_groups"
+```
+
+```{r}
+all_group_regions<-bind_rows(all_regions_s, all_regions_m, all_regions_l) %>% as(.,"GRanges")
+
+proms<-promoters(GenomicFeatures::genes(txdb), upstream = 1500, downstream = 1500)
+ol<-findOverlaps(all_group_regions,proms, type="any")
+GO[subjectHits(ol),]
+p <- proms[subjectHits(ol),] %>% as_tibble()
+pp <- all_group_regions[queryHits(ol),]  %>% as_tibble()
+P_all<-bind_cols(pp,p) %>% dplyr::select(.,seqnames=seqnames...1, start=start...2, end=end...3, width=width...4, strand=strand...5,GeneID=gene_id) 
+P_all_group<-left_join(P_all,GO,by =join_by("GeneID"=="GeneID")) %>% filter(`e-Value`<1e-7) 
+P_all_group_regions<-P_all_group
+```
+
+### GO enrichment
+
+```{r}
+TERM2GENE_ASIL<-data.frame(TermID=GO$`GO IDs`,GeneID=GO$GeneID)
+#split the rows with multiple GO terms seperated by ; and create a new row for each term with the matching GeneID
+TERM2GENE_ASIL<-TERM2GENE_ASIL %>% separate_rows(TermID, sep = ";") %>% filter(!is.na(TermID))
+TERM2NAME_ASIL<-data.frame(TermID=GO$`GO IDs`,GoNAME=GO$`GO Names`)
+TERM2NAME_ASIL<-TERM2NAME_ASIL %>% separate_longer_delim(c(TermID,GoNAME),delim = ";")
+enr<-clusterProfiler::enricher(
+  gene=P_DMRgenes_sig$GeneID,
+  pAdjustMethod = "fdr",
+  universe=P_all_group_regions$GeneID,
+  minGSSize = 2,
+  maxGSSize = 500,
+  qvalueCutoff = 0.1,
+  TERM2GENE=TERM2GENE_ASIL,
+  TERM2NAME = TERM2NAME_ASIL
+)
+
+tibble(as_tibble(enr@result)) %>% filter(Count>1 & p.adjust<0.05) %>% arrange(p.adjust) %>% dplyr::select(Description, GeneRatio, BgRatio, pvalue, p.adjust, geneID)
+```
+
+
+
+### Methylation levels in DMR 
+
+```{r}
+group_dmrs_merged<-GenomicRanges::reduce(group_dmrs_gr)
+bs.filtered<-bs.filtered[, which(pData(bs.filtered)$group %in% c("D1Gen5","D2Gen5","U1Gen5","U2Gen5"))] 
+meth <- getMeth(bs.filtered, group_dmrs_merged, what = "perRegion", confint = FALSE, type = "raw")
+
+#meth <- t(apply(meth, 1, function(xx) tapply(xx, pData(bs.filtered)$group, mean))) %>% as_tibble(meth)
+meth_cen<-meth # - rowMeans(meth)
+rownames(meth)<-c(1:88)
+sample_col<-data.frame(size=pData(bs.filtered)$size,group=pData(bs.filtered)$group)
+rownames(sample_col)<-rownames(pData(bs.filtered))
+my_colour = list(group = c(D1Gen5= "#ffc425", D2Gen5="darkorange", U1Gen5="skyblue", U2Gen5= "darkblue"),size = c(S = "#ddfff7", M = "#83c5be", L = "#006d77"))
+pheat<-pheatmap(as.matrix(meth), cluster_rows = T, annotation_colors=my_colour, annotation_col= sample_col)
+```
+
+```{r}
+bs.filtered.plot<-bs.filtered
+bs.filtered.plot$cols<-ifelse(bs.filtered$group=="D1Gen5","#ffc425",ifelse(bs.filtered$group=="D2Gen5","darkorange",ifelse(bs.filtered$group=="U1Gen5","skyblue","darkblue")))
+bs.filtered.plot$linet<-ifelse(bs.filtered$size=="S",1,ifelse(bs.filtered$size=="M",2,3))
+
+plotManyRegions(bs.filtered.plot, group_dmrs_merged[c(22,62,83),],addPoints = F, extend=1000, col = bs.filtered.plot$cols, lty = bs.filtered.plot$linet)
+plotManyRegions(bs.filtered.plot, group_dmrs_merged[c(41,55,72),],addPoints = F, extend=1000, col = bs.filtered.plot$cols, lty = bs.filtered.plot$linet)
+```
+
+```{r}
+my_colors <- c( "#ffc425", "darkorange","darkgreen","skyblue","darkblue")
+#transpose meth and add group and size
+meth_data<-t(meth) %>% as_tibble() %>% mutate(group=pData(bs.filtered)$group, size=pData(bs.filtered)$size, length=pData(bs.filtered)$length, inversion=pData(bs.filtered)$inversion) 
+#make into long format
+meth_data_long<-gather(meth_data, key="DMR", value="methylation", 1:88)
+#plot DMR41 methylation in jitter plot
+ggplot(meth_data_long %>% filter(DMR=="83") , aes(x=length, y=methylation, fill=group, color=inversion)) +
+  geom_jitter(width = 0.2, height = 0, alpha = 1, size = 3) +
+  scale_color_manual(values = c("lightpink1","#ec0054","#7b002c"), guide = guide_legend("inversion"))+
+  #scale_color_manual(values = my_colors[-3], guide = guide_legend("Selection group"))+
+  #scale_color_manual(values = c("aquamarine","#83c5be","#006d77"), guide = guide_legend("size"))+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  xlab("DMR") +
+  ylab("Methylation") +
+  ggtitle("Methylation levels in DMR41")+
+  facet_wrap(~group)
+
+plotManyRegions(bs.filtered, group_dmrs_merged ,addPoints = T, extend=1000)
+```
+
+
+
+## Chromosome 24 WGBS
+
+```{r}
+set.seed(123)
+sample.idx <- which(pData(bs.filtered)$group %in% c("D2Gen5"))
+bs.filtered_D2 <- bs.filtered[,sample.idx]
+sample.idx <- which(pData(bs.filtered_D2)$inversion %in% c("NN","SS"))
+bs.filtered_D2_invH <- bs.filtered_D2[,sample.idx]
+##remove loci not covered at least 2 times in the number of heterozygous ind (= 4)
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs.filtered_D2_invH, type="Cov")>=2) >= 7)
+bs.filtered_D2_invH_f <- bs.filtered_D2_invH[loci.idx,]
+
+NN <- which(pData(bs.filtered_D2_invH_f)$inversion %in% 'NN')
+SS <- which(pData(bs.filtered_D2_invH_f)$inversion %in% 'SS')
+
+#meth.mat.adj <- ComBat(dat=meth_bs.filtered, batch=as.factor(bs.filtered$batch), par.prior=T, mean.only=F)
+bs.filtered.fit.tstat <- BSmooth.tstat(BSseq=bs.filtered_D2_invH_f,  
+                                    group1 = NN,
+                                    group2 = SS, 
+                                    estimate.var = "same",
+                                    local.correct = T,
+                                    mc.cores =1,
+                                    verbose = TRUE)
+dmrs_all<-bsseq::dmrFinder(bs.filtered.fit.tstat, cutoff = c(-0.6, 0.6), verbose = F) %>% filter(n>=5)
+dmrs_sig <- bsseq::dmrFinder(bs.filtered.fit.tstat, cutoff = c(-4.6, 4.6), verbose = F) %>% filter(n>=5)
+dmrs_sig %>% group_by(chr) %>% summarise(n=n())
+```
+
+```{r}
+dmrs_D2_chr24inv <- dmrs_sig %>% arrange(as.character(chr), start)
+dmrs_D2_chr24inv$DMR<-as.numeric(factor(dmrs_D2_chr24inv$cluster))
+
+meth <- getMeth(bs.filtered_D2, dmrs_D2_chr24inv, what = "perRegion", confint = FALSE, type = "raw")
+
+#meth <- t(apply(meth, 1, function(xx) tapply(xx, pData(bs.filtered)$group, mean))) %>% as_tibble(meth)
+meth_cen<-meth # - rowMeans(meth)
+rownames(meth_cen)<-dmrs_D2_chr24inv$DMR
+sample_col<-data.frame(inversion=pData(bs.filtered_D2)$inversion, size=pData(bs.filtered_D2)$size)
+rownames(sample_col)<-rownames(pData(bs.filtered_D2))
+my_colour = list(size = c(S = "#ddfff7", M = "#83c5be", L = "#006d77"),inversion = c(NN = "lightpink1", NS = "#ec0054", SS = "#7b002c"))
+pheat<-pheatmap(as.matrix(meth_cen), cluster_rows = F, annotation_colors=my_colour, annotation_col= sample_col)
+
+```
+
+```{r}
+regions<-as(dmrs_all, "GRanges")
+positions<-ranges(regions)
+pos<-data.frame(chr=seqnames(regions),positions, areaStat=regions$areaStat) %>% filter(str_starts(chr, "Mme"))
+
+chr_length<-pos %>% group_by(chr) %>% 
+  summarize(chr_l=max(start)) %>%
+  mutate(.,cumsum=lag(c(cumsum(chr_l)))) %>%
+  mutate(cumsum = replace_na(cumsum, 0))
+
+sig_D2<-subsetByOverlaps(as(dmrs_all, "GRanges"),as(dmrs_D2_chr24inv,"GRanges"),type="any")
+regions_sig<-as(sig_D2, "GRanges")
+positions_sig<-ranges(regions_sig)
+pos_sig_D2<-data.frame(chr=seqnames(regions_sig),positions_sig, areaStat=regions_sig$areaStat)  %>% filter(str_starts(chr, "Mme"))
+
+SMP_sig_D2 <- pos_sig_D2 %>%
+  left_join(.,chr_length, by="chr") %>%
+  mutate(BPcum=start+cumsum) 
+
+SMP <- pos %>%
+  left_join(.,chr_length, by="chr") %>%
+  mutate(BPcum=start+cumsum)  
+
+axisdf = SMP %>% group_by(chr) %>% summarize(center=(max(BPcum) + min(BPcum) ) / 2 )
+
+p<-ggplot(SMP, aes(x=BPcum, y=areaStat)) +
+  
+  # Show all points
+  geom_point(aes(color=as.factor(chr)), alpha=0.6, size=2) +
+  geom_point(data=SMP_sig_D2,aes(x=BPcum, y=areaStat),alpha=1, size=6, stroke=1.5, shape=1,color = "#ec0054") +
+  
+  scale_color_manual(values = c(rep(c("black", "lightgray"),15))) +
+  annotate(geom = "text",label=substr(axisdf$chr,5,10), x=axisdf$center, y=rep(c(-400),24), angle=0, size=5)+
+  xlab("") +
+  ylab("fstat across size classes") +
+
+  # Custom the theme:
+  theme_bw(base_size=16) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x  = element_blank(),
+    legend.position="none",
+    panel.border = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    plot.title = element_text(hjust = 0.5))  
+p
+```
+
+
+```{r}
+bs.filtered_D2.plot<-bs.filtered_D2
+#add "#ffc425" to cols if group= D1Gen5, "darkorange" if group= D2Gen5, "skyblue" if group= U1Gen5, "darkblue" if group= U2Gen5
+bs.filtered_D2.plot$cols<-ifelse(bs.filtered_D2.plot$inversion=="NN","lightpink1",ifelse(bs.filtered_D2.plot$inversion=="NS","#ec0054","#7b002c"))
+#add 1 to lty if size= S, 2 if size= M, 3 if size= L
+bs.filtered_D2.plot$linet<-ifelse(bs.filtered_D2.plot$size=="S",1,ifelse(bs.filtered_D2.plot$size=="M",2,3))
+plotManyRegions(bs.filtered_D2.plot,as(dmrs_D2_chr24inv[c(11,39,54),],"GRanges"),col = bs.filtered_D2.plot$cols, lty  = bs.filtered_D2.plot$linet, addPoints = F, extend = 1500)
+```
+
+```{r}
+subsetByOverlaps(as(dmrs_D2_chr24inv, "GRanges"),as(group_dmrs_merged,"GRanges"),type="any")
+subsetByOverlaps(as(dmrs_D2_chr24inv, "GRanges"),as(dmrs_sig_nano,"GRanges"),type="any")
+```
+
+```{r}
+bs.filtered<-bs.filtered[, which(pData(bs.filtered)$group %in% c("D1Gen5","D2Gen5","U1Gen5","U2Gen5"))] 
+meth <- getMeth(bs.filtered, dmrs_D2_chr24inv, what = "perRegion", confint = FALSE, type = "raw")
+
+#meth <- t(apply(meth, 1, function(xx) tapply(xx, pData(bs.filtered)$group, mean))) %>% as_tibble(meth)
+meth_cen<-meth # - rowMeans(meth)
+rownames(meth)<-dmrs_D2_chr24inv$DMR
+sample_col<-data.frame(inv=pData(bs.filtered)$inversion,group=pData(bs.filtered)$group)
+rownames(sample_col)<-rownames(pData(bs.filtered))
+my_colour = list(group = c(D1Gen5= "#ffc425", D2Gen5="darkorange", U1Gen5="skyblue", U2Gen5= "darkblue"),inv = c(NN = "lightpink1", NS = "#ec0054", SS = "#7b002c"))
+pheat<-pheatmap(as.matrix(meth), cluster_rows = F, annotation_colors=my_colour, annotation_col= sample_col)
+```
+
+```{r}
+meth_data<-t(meth) %>% as_tibble() %>% mutate(group=pData(bs.filtered)$group, inv=pData(bs.filtered)$inversion) 
+#make into long format
+meth_data_long<-gather(meth_data, key="DMR", value="methylation", 1:80)
+#plot DMR41 methylation in jitter plot
+ggplot(meth_data_long %>% filter(group=="D2Gen5"), aes(x=inv, y=methylation)) +
+  #stat_summary(fun.data="mean_sdl", fun.args = list(mult = 1))+
+  geom_jitter(width = 0.1, height = 0)+
+  scale_fill_manual(values = my_colors[-3], guide = guide_legend("Selection group"))+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5))+
+  xlab("DMR") +
+  ylab("Methylation") +
+  ggtitle("Methylation levels in DMRs")+
+  facet_wrap(~as.numeric(DMR))
+# for each plot do
+```
+
+##
+
+```{r}
+dmrs_D2<-dmrs_D2_chr24inv %>% as(.,"GRanges")
+proms<-promoters(GenomicFeatures::genes(txdb), upstream = 1500, downstream = 1500)
+ol<-findOverlaps(dmrs_D2,proms, type="any")
+GO[subjectHits(ol),]
+p <- proms[subjectHits(ol),] %>% as_tibble()
+pp <- dmrs_D2[queryHits(ol),]  %>% as_tibble()
+P_DMRs<-bind_cols(pp,p) %>% dplyr::select(.,seqnames=seqnames...1, start=start...2, end=end...3, width=width...4, strand=strand...5,GeneID=gene_id, DMR=DMR) 
+P_DMRgenes<-left_join(P_DMRs,GO,by =join_by("GeneID"=="GeneID")) 
+P_DMRgenes_sig<-P_DMRgenes %>% filter(`e-Value`<1e-7)
+```
+
+```{r}
+all_regions_D2<-dmrs_all %>% as(.,"GRanges")
+proms<-promoters(GenomicFeatures::genes(txdb), upstream = 1500, downstream = 1500)
+ol<-findOverlaps(all_regions_D2,proms, type="any")
+GO[subjectHits(ol),]
+p <- proms[subjectHits(ol),] %>% as_tibble()
+pp <- all_regions_D2[queryHits(ol),]  %>% as_tibble()
+P_all<-bind_cols(pp,p) %>% dplyr::select(.,seqnames=seqnames...1, start=start...2, end=end...3, width=width...4, strand=strand...5,GeneID=gene_id) 
+P_all_group<-left_join(P_all,GO,by =join_by("GeneID"=="GeneID")) 
+P_all_group_regions<-P_all_group %>% filter(`e-Value`<1e-7)
+```
+
+### GO enrichment
+
+```{r}
+TERM2GENE_ASIL<-data.frame(TermID=GO$`GO IDs`,GeneID=GO$GeneID)
+#split the rows with multiple GO terms seperated by ; and create a new row for each term with the matching GeneID
+TERM2GENE_ASIL<-TERM2GENE_ASIL %>% separate_rows(TermID, sep = ";") %>% filter(!is.na(TermID))
+TERM2NAME_ASIL<-data.frame(TermID=GO$`GO IDs`,GoNAME=GO$`GO Names`)
+TERM2NAME_ASIL<-TERM2NAME_ASIL %>% separate_longer_delim(c(TermID,GoNAME),delim = ";")
+enr<-clusterProfiler::enricher(
+  gene=P_DMRgenes_sig$GeneID,
+  pAdjustMethod = "fdr",
+  universe=P_all_group_regions$GeneID,
+  minGSSize = 2,
+  maxGSSize = 500,
+  qvalueCutoff = 0.1,
+  TERM2GENE=TERM2GENE_ASIL,
+  TERM2NAME = TERM2NAME_ASIL
+)
+
+tibble(as_tibble(enr@result)) %>% filter(Count>1 & p.adjust<0.05) %>% arrange(p.adjust) %>% dplyr::select(Description, GeneRatio, BgRatio, pvalue, p.adjust, geneID)
+```
+
+```{r}
+dmrs_D2_chr24inv_table<-P_DMRgenes_sig %>% filter(`e-Value`<1e-7) %>% dplyr::select(DMR, GeneID,Description) %>% unique(.) %>% left_join(dmrs_D2_chr24inv,.,by="DMR")
+clipr::write_clip(dmrs_D2_chr24inv_table)
+
+bs.filtered.plot<-bs.filtered
+bs.filtered.plot$cols<-ifelse(bs.filtered.plot$group=="D1Gen5","#ffc425",ifelse(bs.filtered.plot$group=="D2Gen5","darkorange",ifelse(bs.filtered.plot$group=="U1Gen5","skyblue","darkblue")))
+bs.filtered.plot$linet<-ifelse(bs.filtered.plot$size=="S",1,ifelse(bs.filtered.plot$size=="M",2,3))
+bs.filtered.plot$cols<-ifelse(bs.filtered.plot$inversion=="NN","lightpink1",ifelse(bs.filtered.plot$inversion=="NS","#ec0054","#7b002c"))
+plotManyRegions(bs.filtered.plot, dmrs_D2_chr24inv,addPoints = F, extend=1000, col = bs.filtered.plot$cols, lty = bs.filtered.plot$linet)
+```
+
+##most significant DMRs
+
+```{r}
+bs.filtered.plot<-bs.filtered
+bs.filtered.plot$linet<-ifelse(bs.filtered.plot$size=="S",1,ifelse(bs.filtered.plot$size=="M",2,3))
+bs.filtered.plot$cols<-ifelse(bs.filtered.plot$group=="D1Gen5","#ffc425",ifelse(bs.filtered.plot$group=="D2Gen5","darkorange",ifelse(bs.filtered.plot$group=="U1Gen5","skyblue","darkblue")))
+bs.filtered.plot$cols<-ifelse(bs.filtered.plot$inversion=="NN","lightpink1",ifelse(bs.filtered.plot$inversion=="NS","#ec0054","#7b002c"))
+plotManyRegions(bs.filtered.plot, dmrs_D2_gr[54,],addPoints = F, extend=2500, col = bs.filtered.plot$cols)
+plotManyRegions(bs.filtered.plot, dmrs_D2_gr[39,],addPoints = F, extend=2500, col = bs.filtered.plot$cols)
+plotManyRegions(bs.filtered.plot, as(group_dmrs_merged[83,],"GRanges"),addPoints = F, extend=2500, col = bs.filtered.plot$cols, lty=bs.filtered.plot$linet)
+plotManyRegions(bs.filtered.plot, as(dmrs_sig_nano[64,],"GRanges"),addPoints = F, extend=1000, col = bs.filtered.plot$cols)
+```
+
+```{r}
+bs_24.plot<-bs_24_smooth
+bs_24.plot$cols<-ifelse(bs_24.plot$pop=="SS","#7b002c",ifelse(bs_24.plot$pop=="NS","#ec0054","lightpink1"))
+plotManyRegions(bs_24.plot, dmrs_D2_gr[54,],addPoints = F, extend=2500, col = bs_24.plot$cols)
+plotManyRegions(bs_24.plot, dmrs_D2_gr[39,],addPoints = F, extend=2500, col = bs_24.plot$cols)
+plotManyRegions(bs_24.plot, as(group_dmrs_merged[83,],"GRanges"),col = bs_24.plot$cols, addPoints = F, extend = 2500)
+plotManyRegions(bs_24.plot, as(dmrs_sig_nano[64,],"GRanges"),addPoints = F, extend=2500, col = bs_24.plot$cols)
+```
+
+
+
+
+```{r}
+cyc<-getMeth(bs.filtered.plot, as(dmrs_sig_nano[64,],"GRanges"), what = "perRegion", confint = FALSE, type = "raw")
+rd3<-getMeth(bs.filtered.plot, as(group_dmrs_merged[83,],"GRanges"), what = "perRegion", confint = FALSE, type = "raw")
+plot(cyc, rd3)
+```
+
+```{r}
+cyc<-getMeth(bs_24.plot, as(dmrs_sig_nano[64,],"GRanges"), what = "perRegion", confint = FALSE, type = "raw")
+rd3<-getMeth(bs_24.plot, as(group_dmrs_merged[83,],"GRanges"), what = "perRegion", confint = FALSE, type = "raw")
+plot(cyc, rd3)
+```
+
+### Nanopore 
+
+```{r}
+dmrs_nano_gr<-dmrs_sig_nano %>% as(.,"GRanges")
+proms<-promoters(GenomicFeatures::genes(txdb), upstream = 1500, downstream = 1500)
+ol<-findOverlaps(dmrs_nano_gr,proms, type="any")
+GO[subjectHits(ol),]
+p <- proms[subjectHits(ol),] %>% as_tibble()
+pp <- dmrs_nano_gr[queryHits(ol),]  %>% as_tibble()
+P_DMRs<-bind_cols(pp,p) %>% dplyr::select(.,seqnames=seqnames...1, start=start...2, end=end...3, width=width...4, strand=strand...5,GeneID=gene_id) 
+P_DMRgenes<-left_join(P_DMRs,GO,by =join_by("GeneID"=="GeneID")) 
+P_DMRgenes_sig<-P_DMRgenes
+```
+
+```{r}
+all_regions_nano<-dmrs_all %>% as(.,"GRanges")
+
+proms<-promoters(GenomicFeatures::genes(txdb), upstream = 1500, downstream = 1500)
+ol<-findOverlaps(all_regions_nano,proms, type="any")
+GO[subjectHits(ol),]
+p <- proms[subjectHits(ol),] %>% as_tibble()
+pp <- all_regions_nano[queryHits(ol),]  %>% as_tibble()
+P_all<-bind_cols(pp,p) %>% dplyr::select(.,seqnames=seqnames...1, start=start...2, end=end...3, width=width...4, strand=strand...5,GeneID=gene_id) 
+P_all_group<-left_join(P_all,GO,by =join_by("GeneID"=="GeneID")) 
+P_all_group_regions<-P_all_group
+```
+
+
+#### GO enrichment
+
+```{r}
+TERM2GENE_ASIL<-data.frame(TermID=GO$`GO IDs`,GeneID=GO$GeneID)
+#split the rows with multiple GO terms seperated by ; and create a new row for each term with the matching GeneID
+TERM2GENE_ASIL<-TERM2GENE_ASIL %>% separate_rows(TermID, sep = ";") %>% filter(!is.na(TermID))
+TERM2NAME_ASIL<-data.frame(TermID=GO$`GO IDs`,GoNAME=GO$`GO Names`)
+TERM2NAME_ASIL<-TERM2NAME_ASIL %>% separate_longer_delim(c(TermID,GoNAME),delim = ";")
+enr<-clusterProfiler::enricher(
+  gene=P_DMRgenes_sig$GeneID,
+  pAdjustMethod = "fdr",
+  universe=P_all_group_regions$GeneID,
+  minGSSize = 2,
+  maxGSSize = 500,
+  qvalueCutoff = 0.1,
+  TERM2GENE=TERM2GENE_ASIL,
+  TERM2NAME = TERM2NAME_ASIL
+)
+
+tibble(as_tibble(enr@result)) %>% filter(Count>1 & qvalue<0.1) %>% arrange(qvalue) %>% dplyr::select(Description, GeneRatio, BgRatio, pvalue, qvalue, geneID)
+```
+
+
+## Nanopore 
+
+```{r}
+#setwd("~/Documents/Silversides")
+files<-list.files("~/Documents/Silversides/modkits", pattern ="NN", full.names=TRUE)
+bs_NN<-Read.modkits(files, strandCollapse = T)
+bs_NN_24<-chrSelectBSseq(bs_NN, seqnames = c("Mme_chr01","Mme_chr02","Mme_chr03","Mme_chr04","Mme_chr05","Mme_chr06","Mme_chr07","Mme_chr08","Mme_chr09","Mme_chr10","Mme_chr11","Mme_chr12","Mme_chr13","Mme_chr14","Mme_chr15","Mme_chr16","Mme_chr17","Mme_chr18","Mme_chr19","Mme_chr20","Mme_chr21","Mme_chr22","Mme_chr23","Mme_chr24"))
+
+files<-list.files("~/Documents/Silversides/modkits", pattern ="NS" ,full.names=TRUE)
+bs_NS<-Read.modkits(files, strandCollapse = T)
+bs_NS_24<-chrSelectBSseq(bs_NS, seqnames = c("Mme_chr01","Mme_chr02","Mme_chr03","Mme_chr04","Mme_chr05","Mme_chr06","Mme_chr07","Mme_chr08","Mme_chr09","Mme_chr10","Mme_chr11","Mme_chr12","Mme_chr13","Mme_chr14","Mme_chr15","Mme_chr16","Mme_chr17","Mme_chr18","Mme_chr19","Mme_chr20","Mme_chr21","Mme_chr22","Mme_chr23","Mme_chr24"))
+
+files<-list.files("~/Documents/Silversides/modkits", pattern ="SS" ,full.names=TRUE)
+bs_SS<-Read.modkits(files, strandCollapse = T)
+bs_SS_24<-chrSelectBSseq(bs_SS, seqnames = c("Mme_chr01","Mme_chr02","Mme_chr03","Mme_chr04","Mme_chr05","Mme_chr06","Mme_chr07","Mme_chr08","Mme_chr09","Mme_chr10","Mme_chr11","Mme_chr12","Mme_chr13","Mme_chr14","Mme_chr15","Mme_chr16","Mme_chr17","Mme_chr18","Mme_chr19","Mme_chr20","Mme_chr21","Mme_chr22","Mme_chr23","Mme_chr24"))
+```
+
+
+```{r}
+files<-list.files("~/Documents/Silversides/modkits", full.names=T)
+bs<-Read.modkits(files, strandCollapse = T)
+bs<-chrSelectBSseq(bs, seqnames = c("Mme_chr01","Mme_chr02","Mme_chr03","Mme_chr04","Mme_chr05","Mme_chr06","Mme_chr07","Mme_chr08","Mme_chr09","Mme_chr10","Mme_chr11","Mme_chr12","Mme_chr13","Mme_chr14","Mme_chr15","Mme_chr16","Mme_chr17","Mme_chr18","Mme_chr19","Mme_chr20","Mme_chr21","Mme_chr22","Mme_chr23","Mme_chr24"))
+
+```
+
+```{r}
+results <- tibble()
+for (i in 1:9) {
+  sites_count <- length(which(DelayedMatrixStats::rowSums2(getCoverage(bs, type = "Cov") >= 2) >= i))
+  results <- bind_rows(results, tibble(threshold = i, sites = sites_count))
+}
+#plot the results with
+ggplot(results, aes(x = threshold, y= sites)) +
+  geom_point() +
+  geom_line() +
+  xlab("Number of samples threshold") +
+  ylab("Number of sites") +
+  ggtitle("Number of sites with coverage above 2X in x samples")
+```
+
+```{r}
+results <- tibble()
+for (i in 1:30) {
+  sites_count <- length(which(DelayedMatrixStats::rowSums2(getCoverage(bs, type = "Cov") >= i) == 9))
+  results <- bind_rows(results, tibble(threshold = i, sites = sites_count))
+}
+
+#plot the results with
+ggplot(results, aes(x = as.factor(threshold), y= sites)) +
+  geom_point() +
+  geom_line() +
+  xlab("Coverage threshold") +
+  ylab("Number of sites") +
+  ggtitle("Number of sites with coverage above threshold in all samples")
+```
+
+
+
+```{r}
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs, type="Cov")>= 2) >= 3)
+bs.filtered <- bs[loci.idx,]
+```
+
+```{r}
+NN_1_het<-granges(bs.filtered[,1][getHeterozygous(bs.filtered[,1], threshold = 0.99)]) %>% as_tibble() %>% mutate(sample="NN1",pop="NN")
+NN_2_het<-granges(bs.filtered[,2][getHeterozygous(bs.filtered[,2], threshold = 0.99)]) %>% as_tibble() %>% mutate(sample="NN2",pop="NN")
+NN_3_het<-granges(bs.filtered[,3][getHeterozygous(bs.filtered[,3], threshold = 0.99)]) %>% as_tibble() %>% mutate(sample="NN3",pop="NN")
+NS_1_het<-granges(bs.filtered[,4][getHeterozygous(bs.filtered[,4], threshold = 0.99)]) %>% as_tibble() %>% mutate(sample="NS1",pop="NS")
+NS_2_het<-granges(bs.filtered[,5][getHeterozygous(bs.filtered[,5], threshold = 0.99)]) %>% as_tibble() %>% mutate(sample="NS2",pop="NS")
+NS_3_het<-granges(bs.filtered[,6][getHeterozygous(bs.filtered[,6], threshold = 0.99)]) %>% as_tibble() %>% mutate(sample="NS3",pop="NS")
+SS_1_het<-granges(bs.filtered[,7][getHeterozygous(bs.filtered[,7], threshold = 0.99)]) %>% as_tibble() %>% mutate(sample="SS1",pop="SS")
+SS_2_het<-granges(bs.filtered[,8][getHeterozygous(bs.filtered[,8], threshold = 0.99)]) %>% as_tibble() %>% mutate(sample="SS2",pop="SS")
+SS_3_het<-granges(bs.filtered[,9][getHeterozygous(bs.filtered[,9], threshold = 0.99)]) %>% as_tibble() %>% mutate(sample="SS3",pop="SS")
+
+het<-bind_rows(NN_1_het,NN_2_het,NN_3_het,NS_1_het,NS_2_het,NS_3_het,SS_1_het,SS_2_het,SS_3_het) %>% mutate(win=round(start/1000000,3)) %>% group_by(seqnames, sample, pop, win) %>% summarise(n=n())
+
+
+my_colors_3 <- c("#7b002c","#ec0054","lightpink1")
+
+ggplot(het %>% filter(seqnames=="Mme_chr08"),aes(x=win, y=n, color=pop, group=sample)) + geom_point(alpha=0.1) + theme_bw(base_size=16) + xlab("Chr 24 position (mb)") + ylab("Heterozygosity on chromosome 24") + ggtitle("Heterozygous sites on chromosome 24") + ylim(0,25) + geom_smooth(se=FALSE) + scale_color_manual(values=my_colors_3)
+#add a line at x 3.633329 in the plot above
+ggplot(het,aes(x=win, y=n, color=pop, group=sample)) + geom_point(alpha=0.1) + theme_bw(base_size=16) + xlab("Chr 24 position (mb)") + ylab("Heterozygosity on chromosome 24") +ylim(c(0,15)) + ggtitle("Heterozygous sites on chromosome 24") + geom_smooth(se=FALSE) + scale_color_manual(values=my_colors_3) + facet_wrap(~seqnames)
+```
+
+```{r}
+set.seed(123)
+bs_smooth<- BSmooth(
+    BSseq = bs.filtered, 
+    BPPARAM = BiocParallel::MulticoreParam(4),
+    verbose = TRUE)
+pData(bs_smooth)$pop <- c("NN","NN","NN","NS","NS","NS","SS","SS","SS")
+sample.idx <- which(pData(bs_smooth)$pop %in% c("NN","SS"))
+bs_smooth_hom <- bs_smooth[,sample.idx]
+##remove loci not covered at least 2 times in the number of heterozygous ind (= 4)
+
+loci.idx <- which(DelayedMatrixStats::rowSums2(getCoverage(bs_smooth_hom, type="Cov")>=2) >= 4)
+bs_smooth_hom <- bs_smooth_hom[loci.idx,]
+
+NN <- which(pData(bs_smooth_hom)$pop %in% 'NN')
+SS <- which(pData(bs_smooth_hom)$pop %in% 'SS')
+
+#meth.mat.adj <- ComBat(dat=meth_bs.filtered, batch=as.factor(bs.filtered$batch), par.prior=T, mean.only=F)
+bs.filtered.fit.tstat <- BSmooth.tstat(BSseq=bs_smooth_hom,  
+                                    group1 = NN,
+                                    group2 = SS, 
+                                    estimate.var = "same",
+                                    local.correct = T,
+                                    mc.cores =1,
+                                    verbose = TRUE)
+dmrs_all<-bsseq::dmrFinder(bs.filtered.fit.tstat, cutoff = c(-0.6, 0.6), verbose = F) %>% filter(n>=5)
+dmrs_sig_nano <- bsseq::dmrFinder(bs.filtered.fit.tstat, cutoff = c(-4.6, 4.6), verbose = F) %>% filter(n>=5)
+dmrs_sig_nano %>% group_by(chr) %>% summarise(n=n())
+
+#seem like BSseq repports differences from meth.mat.adj
+#meth <- getMeth_adj(BSseq=bs.filtered_D2_invH_f,meth.mat.adj = meth.mat.adj_D2_invH_f, dmrs_sig, what = "perRegion", confint = FALSE, type = "smooth")
+#meth <- t(apply(meth, 1, function(xx) tapply(xx, pData(bs.filtered_D2_invH_f)$inversion, mean)))
+
+dmrs_sig_nano <- dmrs_sig_nano %>% arrange(as.character(chr), start)
+```
+
+
+```{r}
+het_1<-bs[getHeterozygous(bs[,4], threshold = 0.5)]
+het_2<-het_1[getHeterozygous(het_1[,5], threshold = 0.5)]
+het_3<-het_2[getHeterozygous(het_2[,6], threshold = 0.5)]
+hom_4<-het_3[getHomozygous(het_3[,1], threshold = 0.5)]
+hom_5<-hom_4[getHomozygous(hom_4[,2], threshold = 0.5)]
+hom_6<-hom_5[getHomozygous(hom_5[,3], threshold = 0.5)]
+granges(hom_6) %>% as_tibble() %>% bind_cols(.,as_tibble(getCoverage(hom_6))) %>% gather(., key="sample", value="coverage", 6:14) %>% mutate(win=round(start/1000000,0)) %>% group_by(seqnames, win, sample) %>% summarise(mean_cov=mean(coverage)) %>% 
+  ggplot(aes(x=win, y=mean_cov, group=sample, col=sample)) +ylim(0,50) + geom_point() + theme_bw(base_size=16) + xlab("Chr 24 position (mb)") + ylab("Homozygous sites on chromosome 24")
