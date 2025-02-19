@@ -402,6 +402,11 @@ p2<-ggplot(dat, aes(x=dist))+
   theme_bw(base_size=16)
 
 grid.arrange(p2,p1, ncol=1)
+
+length(unique(GenomicFeatures::genes(txdb))$gene_id)
+
+
+7364758/9083615
 ```
 
 
